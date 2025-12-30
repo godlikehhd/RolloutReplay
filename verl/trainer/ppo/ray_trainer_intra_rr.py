@@ -46,6 +46,7 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 import sys
+import random
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -62,6 +63,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+
 
 
 
@@ -1260,10 +1262,10 @@ class RayPPOTrainer:
 
         # 构建 index → [list of positions] 映射
         from collections import defaultdict
-        # if self.replay_index_to_positions is None:
-        self.replay_index_to_positions = defaultdict(list)
-        for pos, idx in enumerate(index_source):
-            self.replay_index_to_positions[idx].append(pos)
+        if self.replay_index_to_positions is None:
+            self.replay_index_to_positions = defaultdict(list)
+            for pos, idx in enumerate(index_source):
+                self.replay_index_to_positions[idx].append(pos)
         
         
         
@@ -1273,8 +1275,11 @@ class RayPPOTrainer:
         for idx in index_target:
             if idx in self.replay_index_to_positions:
                 selected_positions.extend(self.replay_index_to_positions[idx])
+                self.replay_index_to_positions.pop(idx, None)
             else:
-                print(f"[Warning] index {idx} not found in replay buffer")
+                random_key = random.choice(list(self.replay_index_to_positions.keys()))
+                selected_positions.extend(self.replay_index_to_positions[random_key])
+                self.replay_index_to_positions.pop(random_key, None)
 
         # 去重并按原顺序排序
         selected_positions = sorted(set(selected_positions))
@@ -1309,7 +1314,7 @@ class RayPPOTrainer:
 
         # if global_steps is 100, merge the model
 
-        print(f"global_steps: {self.global_steps}")
+        # print(f"global_steps: {self.global_steps}")
         # if self.global_steps % 100 == 0 and self.global_steps > 0:
         #     print(f"Resetting model at global step {self.global_steps}")
         #     self._reset_model()
@@ -1833,6 +1838,10 @@ class RayPPOTrainer:
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
+
+                if self.config.trainer.do_reset and self.global_steps % self.config.trainer.reset_freq == 0 and self.global_steps > 0:
+                    print(f"Resetting model at global step {self.global_steps}")
+                    self._reset_model()
                 self.global_steps += 1
 
                 if (
@@ -1858,6 +1867,7 @@ class RayPPOTrainer:
                 self.replay_buffer_new.save_to_disk(replay_buffer_dir)
             self.replay_buffer = self.replay_buffer_new
             self.replay_buffer_new = None
+            self.replay_index_to_positions = None
             
     def compute_correct_ratio(self, batch: DataProto) -> tuple[int, int]:
         rewards = batch.batch['token_level_scores'].sum(-1)

@@ -102,6 +102,11 @@ python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.do_replay=False \
+    trainer.replay_mode=baseline \
+    trainer.replay_ratio=0.5 \
+    trainer.do_reset=False \
+    trainer.reset_freq=20 \
+    trainer.reset_alpha=0.9 \
     trainer.default_local_dir=${OUTPUT_DIR} \
     trainer.save_freq=50 \
     trainer.test_freq=20 \

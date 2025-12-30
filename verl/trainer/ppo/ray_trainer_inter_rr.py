@@ -1124,7 +1124,7 @@ class RayPPOTrainer:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
     def _reset_model(self):
-        self.actor_rollout_wg.reset_model(alpha=0.9)
+        self.actor_rollout_wg.reset_model(alpha=self.config.trainer.reset_alpha)
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
         if do_profile:
@@ -1810,6 +1810,10 @@ class RayPPOTrainer:
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
+
+                if self.config.trainer.do_reset and self.global_steps % self.config.trainer.reset_freq == 0 and self.global_steps > 0:
+                    print(f"Resetting model at global step {self.global_steps}")
+                    self._reset_model()
                 self.global_steps += 1
 
                 if (

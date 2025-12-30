@@ -41,13 +41,15 @@ def main(config):
     """
     os.environ["VERIFICATION_REWARD_TYPE"] = config.reward_config.verification_reward_type
     os.environ["AUXILIARY_REWARDS"] = config.reward_config.auxiliary_rewards
-    replay_type = config.replay_type
-    if replay_type == "inter_rr":
+    replay_type = config.trainer.replay_model
+    if replay_type == "baseline":
+        from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+    elif replay_type == "inter_rr":
         from verl.trainer.ppo.ray_trainer_inter_rr import RayPPOTrainer
     elif replay_type == "intra_rr":
         from verl.trainer.ppo.ray_trainer_intra_rr import RayPPOTrainer
     else:
-        from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+        raise ValueError(f"Invalid replay model: {replay_type}")
 
     run_ppo(config)
 

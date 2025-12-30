@@ -179,11 +179,12 @@ trainer:
 
   do_replay: False
 
-  replay_ratio: 0.125
+  replay_ratio: 0.5
   replay_mode: inter_prompt
 
   do_reset: False
   reset_freq: 100
+  reset_alpha: 0.9
   
  
 
