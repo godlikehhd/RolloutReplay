@@ -24,6 +24,10 @@ from pathlib import Path
 from typing import Any
 
 
+os.environ["WANDB_API_KEY"] = os.getenv("WANDB_API_KEY", '16b5bad0d1c1d68b959a024003969f9620561990') # 将引号内的+替换成自己在wandb上的一串值
+os.environ["WANDB_MODE"] = os.getenv("WANDB_MODE", "offline")  
+os.environ["WANDB_DIR"] = os.getenv("WANDB_DIR", "/home/yhe/wandb_logs")
+
 class Tracking:
     """A unified tracking interface for logging experiment data to multiple backends.
 

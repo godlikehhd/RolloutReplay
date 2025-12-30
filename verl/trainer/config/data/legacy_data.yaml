@@ -46,6 +46,7 @@ return_raw_chat: False
 return_full_prompt: False
 
 # Whether to shuffle the data in the dataloader.
+weighted_random_sampler: False
 shuffle: True
 
 # num dataloader workers

@@ -95,6 +95,108 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+import os
+import tempfile
+import torch
+import gc
+from functools import partial
+from typing import Optional
+
+# 如果你使用 FSDP 的高级 API（torch.distributed.fsdp），下面可选导入
+try:
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    # FullStateDictConfig 出现在较新 PyTorch 版本
+    try:
+        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+        _HAS_FSDP_FULLSTATE = True
+    except Exception:
+        _HAS_FSDP_FULLSTATE = False
+except Exception:
+    FSDP = None
+    _HAS_FSDP_FULLSTATE = False
+
+
+
+def _save_full_state_dict(module: torch.nn.Module, save_path: str, offload_to_cpu: bool = True):
+    """
+    Save a *full* state_dict of `module` to save_path.
+    Works for regular nn.Module and attempts to handle FSDP if present.
+    - For regular modules: torch.save(module.state_dict(), save_path)
+    - For FSDP (if available): try to use FullStateDictConfig to gather full weights.
+    NOTE: For some FSDP versions you may need to adapt this to your local util functions.
+    """
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    # If module is FSDP instance and we have FullStateDictConfig, use it
+    if FSDP is not None and isinstance(module, FSDP) and _HAS_FSDP_FULLSTATE:
+        # gather full state to CPU then save
+        full_state = module.state_dict(
+            state_dict_type=StateDictType.FULL_STATE_DICT
+            if hasattr(StateDictType, "FULL_STATE_DICT") else None,
+            full_state_dict_config=FullStateDictConfig(offload_to_cpu=offload_to_cpu)
+        )
+        # full_state is a dict of tensors (already on CPU if offload_to_cpu True)
+        torch.save(full_state, save_path)
+    else:
+        # fallback: try to move module to cpu temporarily if needed then save state_dict
+        cpu_moved = False
+        try:
+            sd = module.state_dict()
+            # Ensure tensors on CPU
+            for k, v in sd.items():
+                if v.device != torch.device("cpu"):
+                    sd[k] = v.cpu()
+            torch.save(sd, save_path)
+        finally:
+            # nothing to do here; do NOT in-place move model to CPU to avoid side effects
+            pass
+
+
+def _load_state_dict_to_module(module: torch.nn.Module, state_dict: dict, map_location='cpu'):
+    """
+    Load a (full) state_dict into a module.
+    If module is FSDP, you should ensure module is in the right device/state (see caller).
+    """
+    # Move tensors to the target device expected by module.state_dict() keys
+    # Usually, load_state_dict will accept CPU tensors and perform proper copying.
+    module.load_state_dict(state_dict)
+
+
+def _merge_state_dicts(model_sd: dict, ref_sd: dict, alpha: float, merged_name: Optional[str] = None):
+    """
+    Merge two state_dicts on CPU: merged = alpha * model + (1-alpha) * ref.
+    If merged_name is provided, only merge parameters whose key contains merged_name;
+    others are taken from ref_sd (per your original code).
+    """
+    merged = {}
+    for k in ref_sd.keys():
+        # ensure both dicts contain the key (if model_sd missing, fallback to ref)
+        a = model_sd.get(k, None)
+        b = ref_sd.get(k, None)
+        if a is None:
+            merged[k] = b.clone() if isinstance(b, torch.Tensor) else b
+            continue
+        if b is None:
+            merged[k] = a.clone() if isinstance(a, torch.Tensor) else a
+            continue
+
+        # merge or bypass
+        if merged_name is None or merged_name in k:
+            # do linear combination on tensors
+            if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+                # ensure on CPU and same dtype
+                a_cpu = a.to('cpu')
+                b_cpu = b.to('cpu')
+                merged[k] = (alpha * a_cpu + (1.0 - alpha) * b_cpu).to(a_cpu.dtype)
+            else:
+                # non-tensor fallback to ref
+                merged[k] = b
+        else:
+            # keep ref param
+            merged[k] = b.clone() if isinstance(b, torch.Tensor) else b
+    return merged
+
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -862,6 +964,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 metrics = self.actor.update_policy(data=data)
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
+            
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
             metrics["perf/mfu/actor"] = (
                 estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
@@ -1067,6 +1170,71 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_model(self, alpha=0.5, merged_name=None):
+        """
+        Reset actor_model by merging with a base HuggingFace model:
+            new = alpha * actor + (1 - alpha) * base
+        """
+
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+        import torch
+        import gc
+        from transformers import AutoModelForCausalLM
+
+        # 如果参数被 offload，则先移回 GPU
+        if getattr(self, "_is_offload_param", False):
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        # 1. 导出 actor 当前 full state dict
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+        with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT, cfg):
+            actor_sd = self.actor_module_fsdp.state_dict()
+
+        # 2. 从本地加载 HuggingFace base 模型
+        ref_model = AutoModelForCausalLM.from_pretrained(
+            self.config.model.path,
+            torch_dtype=torch.float32,
+            device_map="cpu",
+            trust_remote_code=True,
+        )
+        base_sd = ref_model.state_dict()
+        del ref_model
+        gc.collect()
+
+        # 3. merge 参数
+        merged_sd = {}
+        for name, actor_param in actor_sd.items():
+            base_param = base_sd.get(name, None)
+
+            # 如果 base 里没有该参数（通常不会发生）
+            if base_param is None:
+                merged_sd[name] = actor_param
+                continue
+
+            # 不参与 merge 的层直接用 base
+            if merged_name is not None and merged_name not in name:
+                merged_sd[name] = base_param
+                continue
+
+            # alpha 融合
+            merged_sd[name] = alpha * actor_param + (1 - alpha) * base_param
+
+        del actor_sd, base_sd
+        gc.collect()
+
+        # 4. load 回 FSDP model
+        with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT, cfg):
+            self.actor_module_fsdp.load_state_dict(merged_sd)
+
+        # 如果 offload，继续 offload 回 CPU
+        if getattr(self, "_is_offload_param", False):
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        print(f"[Rank {self.rank}] Model reset done with alpha={alpha}.")
+
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):

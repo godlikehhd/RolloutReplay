@@ -24,7 +24,7 @@ from omegaconf import OmegaConf
 
 from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
@@ -39,6 +39,16 @@ def main(config):
     Args:
         config_dict: Hydra configuration dictionary containing training parameters.
     """
+    os.environ["VERIFICATION_REWARD_TYPE"] = config.reward_config.verification_reward_type
+    os.environ["AUXILIARY_REWARDS"] = config.reward_config.auxiliary_rewards
+    replay_type = config.replay_type
+    if replay_type == "inter_rr":
+        from verl.trainer.ppo.ray_trainer_inter_rr import RayPPOTrainer
+    elif replay_type == "intra_rr":
+        from verl.trainer.ppo.ray_trainer_intra_rr import RayPPOTrainer
+    else:
+        from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
     run_ppo(config)
 
 
@@ -293,7 +303,7 @@ class TaskRunner:
         # Create training and validation datasets.
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
-        train_sampler = create_rl_sampler(config.data, train_dataset)
+        # train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
         trainer = RayPPOTrainer(
@@ -308,7 +318,7 @@ class TaskRunner:
             train_dataset=train_dataset,
             val_dataset=val_dataset,
             collate_fn=collate_fn,
-            train_sampler=train_sampler,
+          
         )
         # Initialize the workers of the trainer.
         trainer.init_workers()
@@ -366,7 +376,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
     return dataset
 
 
-def create_rl_sampler(data_config, dataset):
+def create_rl_sampler(data_config, dataset, value_tracker=None):
     """Create a sampler for the dataset.
 
     Arguments:
@@ -377,7 +387,7 @@ def create_rl_sampler(data_config, dataset):
         sampler (Sampler): The sampler.
     """
     import torch
-    from torch.utils.data import RandomSampler, SequentialSampler
+    from torch.utils.data import RandomSampler, SequentialSampler, WeightedRandomSampler
 
     if data_config.sampler is not None and data_config.sampler.get("class_path", None) is not None:
         curriculum_class = load_extern_type(
@@ -397,10 +407,15 @@ def create_rl_sampler(data_config, dataset):
 
     # Use a sampler to facilitate checkpoint resumption.
     # If shuffling is enabled in the data configuration, create a random sampler.
+    elif data_config.weighted_random_sampler:
+        weights = value_tracker.weights()
+        sampler = WeightedRandomSampler(weights=weights, num_samples=len(dataset), replacement=True)
+        print("using weighted random sampler")
     elif data_config.shuffle:
         train_dataloader_generator = torch.Generator()
         train_dataloader_generator.manual_seed(data_config.get("seed", 1))
         sampler = RandomSampler(data_source=dataset, generator=train_dataloader_generator)
+    
     else:
         # If shuffling is disabled, use a sequential sampler to iterate through the dataset in order.
         sampler = SequentialSampler(data_source=dataset)

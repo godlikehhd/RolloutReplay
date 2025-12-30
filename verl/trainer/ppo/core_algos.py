@@ -96,6 +96,7 @@ class AdvantageEstimator(str, Enum):
 
     GAE = "gae"
     GRPO = "grpo"
+    SPO = "spo"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
@@ -260,6 +261,47 @@ def compute_gae_advantage_return(
     return advantages, returns
 
 
+@register_adv_est("spo")
+def compute_spo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    values: torch.Tensor,
+    index: np.ndarray = None,  # SPO batch-level 不需要 group index
+    epsilon: float = 1e-6,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute SPO-style advantage using batch-level normalization.
+    """
+    
+
+    # 2. 基础优势
+    values = values.squeeze(-1) if values.dim() > 1 else values
+    with torch.no_grad():
+        # 1. 聚合 token-level reward
+        outcome_scores = token_level_rewards.sum(dim=-1)  # (bs,)
+        raw_adv = outcome_scores - values  # (bs,)
+        # print("advantage before normalize: ", raw_adv)
+        # print("normalize_batch_advantage: ", config.get("normalize_batch_advantage", False))
+        if config is not None and config.get("normalize_batch_advantage", False):
+            
+            # 3. batch-level 归一化
+            mean = raw_adv.mean()
+            std = raw_adv.std() + epsilon
+            raw_adv = (raw_adv - mean) / std  # (bs,)
+            # print("advantage after normalize: ", raw_adv)
+        # 4. 扩展为 token-level 并乘 mask
+        adv_tensor = raw_adv.unsqueeze(-1) * response_mask
+        
+    # 5. 可选扰动
+    print("perturb_advantage: ", config.get("perturb_advantage", False))
+    if config is not None and config.get("perturb_advantage", False):
+        adv_tensor = perturb_advantage(adv_tensor) * response_mask
+
+    return adv_tensor, adv_tensor
+
+
+
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
 @register_adv_est(AdvantageEstimator.GRPO)  # or simply: @register_adv_est("grpo")
 def compute_grpo_outcome_advantage(
@@ -323,10 +365,31 @@ def compute_grpo_outcome_advantage(
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
+        
         scores = scores.unsqueeze(-1) * response_mask
-
+        if config is not None and config.get("perturb_advantage", False):
+            perturb = perturb_advantage(scores)
+            # 再次乘mask保证padding部分保持0
+            scores = perturb * response_mask
     return scores, scores
 
+def perturb_advantage(adv):
+    """
+    对优势矩阵 adv 添加扰动。
+    adv: Tensor[batch_size, seq_len]
+         每个元素是该位置的优势（同一个序列上可相同）
+    返回: 加扰动后的优势
+    """
+    # 生成同形噪声 N(0,1)
+    noise = torch.randn_like(adv, device=adv.device)
+
+    # 裁剪到 [-|adv|, |adv|] 范围
+    noise = torch.clamp(noise, -adv.abs()+1e-3, adv.abs()-1e-3)
+
+    # 添加扰动
+    perturbed_adv = adv + noise
+    
+    return perturbed_adv
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)
 def compute_grpo_vectorized_outcome_advantage(
@@ -804,6 +867,450 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
 
     return loss
 
+@torch.no_grad()
+def get_ratio_stats(ratio: torch.Tensor,
+                    advantages: torch.Tensor,
+                    response_mask: torch.Tensor,
+                    log_prob: torch.Tensor,
+                    old_log_prob: torch.Tensor,
+                    bins=(0.2, 0.5, 0.8, 1.0, 1.2, 1.5, 2.0),
+                    eps: float = 1e-12,
+                    tol: float = 1e-6):
+    """
+    Summarize ratio distribution for three advantage conditions (pos, neg, nonzero).
+    Keeps the (0.8, 1.0) bin AND adds an explicit eq_1.0 bin.
+
+    Final bin order (len=9):
+        (-inf, 0.2], (0.2, 0.5], (0.5, 0.8], (0.8, 1.0), eq_1.0,
+        (1.0, 1.2], (1.2, 1.5], (1.5, 2.0], (2.0, +inf)
+
+    Returns a dict with keys like:
+        ratio_pos/inf_0.2, ..., ratio_pos/gt_2.0  (fractions in [0,1])
+        ratio_pos/avg (mean of ratio over masked & condition tokens)
+    """
+    mask = response_mask.bool()
+    finite = torch.isfinite(ratio)
+    mask = mask & finite
+
+    edges = torch.tensor(bins, device=ratio.device, dtype=ratio.dtype)
+    # bucketize indices for 8 original bins:
+    # 0:(-inf,0.2], 1:(0.2,0.5], 2:(0.5,0.8], 3:(0.8,1.0], 4:(1.0,1.2], 5:(1.2,1.5], 6:(1.5,2.0], 7:(2.0,+inf)
+    bin_idx = torch.bucketize(ratio, edges, right=True)
+
+    def compute_for(cond: torch.Tensor):
+        m = mask & cond
+        # 9 bins now (insert eq_1.0 at index 4)
+        counts = torch.zeros(len(bins) + 2, device=ratio.device, dtype=torch.float32)
+
+        if m.any():
+            eq1_mask = (torch.abs(ratio - 1.0) <= tol) & m
+            not_eq1_mask = m & (~eq1_mask)
+
+            if not_eq1_mask.any():
+                idx = bin_idx[not_eq1_mask].reshape(-1).long()
+                # shift indices >= 4 (i.e., > 1.0 side) by +1 to make room for eq_1.0 at index 4
+                shift = (idx >= 4).long()
+                idx = idx + shift
+                counts.scatter_add_(0, idx, torch.ones_like(idx, dtype=torch.float32))
+
+            # put exact-1.0 counts at index 4
+            counts[4] = eq1_mask.sum()
+
+        total = counts.sum()
+        frac = counts / (total + eps)
+
+        # average ratio under this condition (masked)
+        if m.any():
+            avg = ratio[m].sum() / (m.sum() + eps)
+        else:
+            avg = torch.tensor(0.0, device=ratio.device, dtype=torch.float32)
+
+        return frac, avg
+
+    results = {}
+    conditions = {
+        "pos": advantages > 0,
+        "neg": advantages < 0,
+        "nonzero": advantages != 0
+    }
+
+    bin_names = [
+        f"inf_{bins[0]}", f"{bins[0]}_{bins[1]}", f"{bins[1]}_{bins[2]}", f"{bins[2]}_{bins[3]}",
+        "eq_1.0",
+        f"{bins[3]}_{bins[4]}", f"{bins[4]}_{bins[5]}", f"{bins[5]}_{bins[6]}", f"gt_{bins[-1]}"
+    ]
+
+    for cond_name, cond_mask in conditions.items():
+        frac, avg = compute_for(cond_mask)
+        for i, bn in enumerate(bin_names):
+            results[f"ratio_{cond_name}/{bn}"] = frac[i].item()
+        results[f"ratio_{cond_name}/avg"] = float(avg.item())
+
+    # ---- append: conditional KL means ----
+    negative_approx_kl = log_prob - old_log_prob    # = log(ratio)
+    approx_kl = -negative_approx_kl                 # PPO-style approx KL ≥ 0
+
+    base_mask = response_mask.bool() & torch.isfinite(ratio) \
+                & torch.isfinite(log_prob) & torch.isfinite(old_log_prob)
+
+    m_neg_r_lt_1 = base_mask & (advantages < 0) & (ratio < (1.0 - tol))
+    m_pos_r_gt_1 = base_mask & (advantages > 0) & (ratio > (1.0 + tol))
+
+    def _mean_where(x: torch.Tensor, m: torch.Tensor):
+        n = m.sum()
+        if n.item() == 0:
+            return torch.tensor(0.0, device=x.device, dtype=torch.float32)
+        return x[m].sum() / (n + eps)
+
+    results["kl_neg_r_lt_1/mean"] = float(_mean_where(approx_kl, m_neg_r_lt_1).item())
+    results["kl_pos_r_gt_1/mean"] = float(_mean_where(approx_kl, m_pos_r_gt_1).item())
+
+    # optional diagnostics
+    total_tokens = int(mask.sum().item())
+    results["kl_neg_r_lt_1/count"] = int(m_neg_r_lt_1.sum().item())
+    results["kl_pos_r_gt_1/count"] = int(m_pos_r_gt_1.sum().item())
+    results["kl_neg_r_lt_1/frac_tokens"] = float((m_neg_r_lt_1.sum() / (mask.sum() + eps)).item()) if total_tokens > 0 else 0.0
+    results["kl_pos_r_gt_1/frac_tokens"] = float((m_pos_r_gt_1.sum() / (mask.sum() + eps)).item()) if total_tokens > 0 else 0.0
+
+    # ---- append: KL stats (flat with kl_stats/ prefix) ----
+
+    conds = {
+        "pos": advantages > 0,
+        "neg": advantages < 0,
+        "nonzero": advantages != 0,
+    }
+
+    def _mean_where(x: torch.Tensor, m: torch.Tensor):
+        n = m.sum()
+        if n.item() == 0:
+            return torch.tensor(0.0, device=x.device, dtype=torch.float32)
+        return x[m].sum() / (n + eps)
+
+    for name, cmask in conds.items():
+        m = base_mask & cmask
+        results[f"kl_stats/{name}_abs_mean"]    = float(_mean_where(negative_approx_kl.abs(), m).item())
+        results[f"kl_stats/{name}_sq_mean"]     = float(_mean_where(negative_approx_kl.pow(2), m).item())
+        results[f"kl_stats/{name}_signed_mean"] = float(_mean_where(-negative_approx_kl, m).item())
+        # results[f"kl_stats/{name}_approx_mean"] = float(_mean_where(approx_kl, m).item())
+
+    return results
+
+
+def compute_m2po_policy_loss(
+    old_log_prob,
+    log_prob,
+    advantages,
+    response_mask,
+    M2_budget: float = None,
+    miniclip_low: float = 0.3,
+    miniclip_high: float = 0.5,
+    loss_agg_mode: str = "token-mean",
+):
+    """
+    Compute policy loss under an M2 (KL^2) budget using per-token clipping bounds.
+
+    Steps:
+      1) Get per-token (clip_low, clip_high) from kpo_clip.
+      2) Compute ratio and apply element-wise clamp.
+      3) Compute surrogate loss -A * ratio_clipped and aggregate.
+
+    Returns:
+      pg_loss:       aggregated policy loss
+      stats:         dict with basic diagnostics (M2 before/after, fractions)
+      clip_low/high: the per-token bounds actually used
+    """
+
+    clip_low, clip_high, M2_data, M2_after = kpo_clip_harmful_tokens(old_log_prob, log_prob, advantages, response_mask, M2_budget)
+
+    clip_low = 1 - clip_low
+    clip_high = clip_high - 1
+    print(f"clip_low: {clip_low}, clip_high: {clip_high}")
+    if miniclip_low is not None and clip_low < miniclip_low:
+        clip_low = miniclip_low
+    if miniclip_high is not None and clip_high < miniclip_high:
+        clip_high = miniclip_high
+
+    # ratio = exp(log_new - log_old)
+    ratio = torch.exp(log_prob - old_log_prob)
+    ppo_kl = verl_F.masked_mean(-(log_prob - old_log_prob), response_mask)
+
+    ratio_stats = get_ratio_stats(ratio, advantages, response_mask, log_prob, old_log_prob)
+
+    ##### clip
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_low, 1 + clip_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+    pg_loss = agg_loss(loss_mat=clip_pg_losses1, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+
+    ratio_stats["m2po/clip_low"] = clip_low
+    ratio_stats["m2po/clip_high"] = clip_high
+    ratio_stats["m2po/M2"] = M2_data
+    ratio_stats["m2po/M2_after"] = M2_after
+    ratio_stats["m2po/M2_budget"] = M2_budget
+
+    return pg_loss, pg_clipfrac, ppo_kl, (ppo_kl - ppo_kl), ratio_stats
+
+def compute_m2po_policy_loss_symmetric(
+    old_log_prob,
+    log_prob,
+    entropy,
+    old_entropy,
+    advantages,
+    response_mask,
+    M2_budget: float = None,
+    miniclip_low: float = 0.3,
+    miniclip_high: float = 0.5,
+    loss_agg_mode: str = "token-mean",
+):
+    """
+    Compute policy loss under an M2 (KL^2) budget using per-token clipping bounds.
+
+    Steps:
+      1) Get per-token (clip_low, clip_high) from kpo_clip.
+      2) Compute ratio and apply element-wise clamp.
+      3) Compute surrogate loss -A * ratio_clipped and aggregate.
+
+    Returns:
+      pg_loss:       aggregated policy loss
+      stats:         dict with basic diagnostics (M2 before/after, fractions)
+      clip_low/high: the per-token bounds actually used
+    """
+
+    clip_low, clip_high, M2_data, M2_after = kpo_clip_harmful_tokens(old_log_prob, log_prob, advantages, response_mask, M2_budget)
+
+    clip_low = 1 - clip_low
+    clip_high = clip_high - 1
+    high_entropy_clip_range = 0.2
+    
+    if miniclip_low is not None and clip_low < miniclip_low:
+        clip_low = miniclip_low
+    if miniclip_high is not None and clip_high < miniclip_high:
+        clip_high = miniclip_high
+    # print(f"clip_low: {clip_low}, clip_high: {clip_high}")
+    # ratio = exp(log_new - log_old)
+    ratio = torch.exp(log_prob - old_log_prob)
+    ppo_kl = verl_F.masked_mean(-(log_prob - old_log_prob), response_mask)
+
+    ratio_stats = get_ratio_stats(ratio, advantages, response_mask, log_prob, old_log_prob)
+
+    delta_entropy = entropy - old_entropy
+    floor_base = 0.6
+    sensitivity = 10.0
+    # 公式：1 - (1-0.6) * exp(-10 * max(0, dH))
+    # dH=0 -> low=0.6 (宽松)
+    # dH=0.1 -> low=0.6 + 0.4*(1-e^-1) ≈ 0.85 (收紧)
+    # dH=0.5 -> low ≈ 0.99 (严厉)
+    decay_factor = torch.exp(-sensitivity * torch.clamp(delta_entropy, min=0.0))
+    dynamic_low = 1.0 - (1.0 - floor_base) * decay_factor
+    
+    # 3. 动态计算 Clip 上限 (针对 r > 1 的限制)
+    # 逻辑：给予一个较宽的基准上限 (4.0)，但如果锐化严重 (delta_entropy < -0.05)，收紧
+    cap_base = 4.0
+    cap_tight = 1.2
+    
+    # 如果熵减超过阈值 (过度锐化)，使用紧上限；否则使用宽上限
+    is_sharpening = delta_entropy < -0.05
+    dynamic_high = torch.where(is_sharpening, cap_tight, cap_base)
+
+    ##### clip
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * torch.clamp(ratio, dynamic_low, dynamic_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    # pg_losses3 = -advantages * torch.clamp(ratio, 1 - 0.6, 1 + 4)  # - clip(entropy - old_entropy, 1-cliprange, 1+cliprange) * A
+    # difference_mask = (pg_losses2 != pg_losses3) & response_mask.bool()  
+
+    # # 基于entropy和difference_mask进行计算
+    # # 1. 获取difference_mask下对应token的熵
+    # masked_entropy = entropy * difference_mask.float()
+    
+    # # 2. 找到熵值最高的前high_entropy_clip_range比例的token位置
+    # # 将masked_entropy展平并找到非零位置
+    # flat_entropy = masked_entropy.flatten()
+    # flat_difference_mask = difference_mask.flatten()
+    
+    # # 获取所有被clip的token的熵值
+    # clip_token_entropies = flat_entropy[flat_difference_mask]
+    
+    # if clip_token_entropies.numel() > 0:
+    #     # 计算需要保留的token数量（前high_entropy_clip_range比例）
+    #     num_high_entropy_tokens = max(1, int(clip_token_entropies.numel() * high_entropy_clip_range))
+        
+    #     # 找到熵值最高的token的阈值
+    #     sorted_entropies, _ = torch.sort(clip_token_entropies, descending=True)
+    #     if num_high_entropy_tokens <= sorted_entropies.numel():
+    #         entropy_threshold = sorted_entropies[num_high_entropy_tokens - 1].item()
+    #     else:
+    #         entropy_threshold = sorted_entropies[-1].item() if sorted_entropies.numel() > 0 else 0.0
+        
+    #     # 3. 基于该位置得到对应部分的log_prob和old_log_prob
+    #     # 创建高熵token的mask（在difference_mask中且熵值>=阈值）
+    #     high_entropy_mask = difference_mask & (masked_entropy >= entropy_threshold)
+        
+    #     # 4. 计算这些token两个logprob的差
+    #     logprob_diff = log_prob - old_log_prob
+        
+        
+    #     # 5. 基于该差的正负对pg_losses2进行mask
+    #     # 对于每个高熵clip token，如果差为负，则进行mask（即使用pg_losses1而不是pg_losses2）
+    #     negative_diff_mask = (logprob_diff > 0) & high_entropy_mask
+        
+    #     # 对于差为负的高熵clip token，使用pg_losses1；否则使用pg_losses2
+    #     pg_losses2_masked = torch.where(negative_diff_mask, pg_losses3, pg_losses2)
+    # else:
+    #     # 如果没有clip token，直接使用pg_losses2
+    #     pg_losses2_masked = pg_losses2
+
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    # pg_clipfrac_m2po = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    # pg_clipfrac_entropy = verl_F.masked_mean(torch.gt(pg_losses3, pg_losses2).float(), response_mask)
+    # pg_clipfrac_std = verl_F.masked_mean(torch.gt(pg_losses3, pg_losses1).float(), response_mask)
+    
+    pg_loss = agg_loss(loss_mat=clip_pg_losses1, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    
+    ratio_stats["m2po/clip_frac"] = pg_clipfrac.detach().item()
+    # ratio_stats["m2po/clip_frac_m2po"] = pg_clipfrac_m2po.detach().item()
+    # ratio_stats["m2po/clip_frac_std"] = pg_clipfrac_std.detach().item()
+    # ratio_stats["m2po/clip_frac_entropy"] = pg_clipfrac_entropy.detach().item()
+    ratio_stats["m2po/clip_low"] = clip_low
+    ratio_stats["m2po/clip_high"] = clip_high
+    ratio_stats["m2po/M2"] = M2_data
+    ratio_stats["m2po/M2_after"] = M2_after
+    ratio_stats["m2po/M2_budget"] = M2_budget
+
+    return pg_loss, pg_clipfrac, ppo_kl, (ppo_kl - ppo_kl), ratio_stats
+
+# we need it
+def kpo_clip_harmful_tokens(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    KL2_budget: float = None
+):
+    """
+    Decide global clip scalars (clip_low, clip_high) under an M2 budget.
+
+    Policy:
+      - Consider only harmful tokens: (A>0 & r>1) or (A<0 & r<1), where r = exp(log_new - log_old).
+      - Sort harmful tokens by delta^2 = (log p_old - log p_new)^2 ascending.
+      - Find a single threshold τ so that capping |delta| at τ across harmful tokens
+        yields overall M2 <= KL2_budget.
+      - Map τ to two global ratio bounds:
+            clip_low  = exp(-τ)  (applies to adv<0 & r<1)
+            clip_high = exp(+τ)  (applies to adv>0 & r>1)
+      - Non-harmful quadrants are not constrained by these bounds.
+
+    Returns:
+      clip_low  (float): lower clamp for tokens with (adv<0 & r<1)
+      clip_high (float): upper clamp for tokens with (adv>0 & r>1)
+    """
+    assert KL2_budget is not None, "KL2_budget must be set."
+
+    tr_tokens_delta_sq = _get_trust_region_tokens_delta_sq(old_log_prob, log_prob, advantages, response_mask)
+    token_num = tr_tokens_delta_sq.numel()
+
+    if token_num == 0: # no clipping needed
+        return 0.0, 100000, 0.0, 0.0
+
+    target_total = KL2_budget * float(token_num)
+    M2_now = float(tr_tokens_delta_sq.sum().detach().item() / token_num)
+
+    if M2_now <= KL2_budget + 1e-12:
+        # No clipping needed -> effectively no constraint
+        return 0.0, 100000, M2_now, M2_now
+
+    print(f"tr-M2_now: {M2_now}")
+    print(f"KL2_budget: {KL2_budget}")
+
+    # import pdb; pdb.set_trace()
+
+    sorted_delta2, _ = torch.sort(tr_tokens_delta_sq)  # ascending
+    tau, M2_after = _solve_tau_from_sorted_delta2(sorted_delta2, target_total)
+
+    # Map |Δ|<=τ to ratio bounds per quadrant
+    clip_low = float(torch.exp(torch.tensor(-tau)).item())   # applies to (adv<0, r<1)
+    clip_high = float(torch.exp(torch.tensor(+tau)).item())  # applies to (adv>0, r>1)
+
+    return clip_low, clip_high, M2_now, M2_after
+
+# we need it
+def _solve_tau_from_sorted_delta2(sorted_delta2: torch.Tensor, target_sum: float) -> float:
+    """
+    Given sorted ascending values v_i = Δ_i^2 (i=0..n-1) and a target sum S,
+    find τ^2 such that sum_i min(v_i, τ^2) = S.
+    This uses a single pass over breakpoints without binary search.
+
+    Returns:
+        tau (float): sqrt(τ^2). If S >= sum(v_i), returns +inf (no clipping needed).
+                     If S <= 0, returns 0.0 (clip everything to 0).
+    """
+
+    if sorted_delta2.numel() == 0:
+        return 100000
+
+    total = float(sorted_delta2.sum().item())
+    if target_sum >= total - 1e-12: # no clipping needed
+        return 100000
+    if target_sum <= 1e-12: # clip everything to 0
+        return 0.0
+
+    csum = torch.cumsum(sorted_delta2, dim=0)  # prefix sums
+    n = sorted_delta2.numel()
+
+    for k in range(0,n):
+        left_sum = float(csum[k].item())
+        rest = n - k - 1
+        m2 = sorted_delta2[k].item() - 1e-12
+        if m2 * rest + left_sum >= target_sum - 1e-12:
+            # print(f"================")
+            # print(f"n: {n}, k: {k}, left_sum: {left_sum}, target_sum: {target_sum}")
+            # print(f"sorted_delta2[k]: {sorted_delta2[k].item()}")
+            # print(f"{list(zip(sorted_delta2[k-5:k+5].tolist(), csum[k-5:k+5].tolist()))}")
+            # print((sorted_delta2 == 0).float().mean())
+            # print(f"{target_sum}")
+            if k == 0:
+                return 0.0, csum[-1].item() / n
+            else:
+                M2_after = (sorted_delta2[k-1].item() * (rest + 1) + float(csum[k-1].item())) / n
+                return float(sorted_delta2[k-1].item() - 1e-12) ** 0.5, M2_after
+
+    return 100000
+
+# we need it
+def _get_trust_region_tokens_delta_sq(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+):
+    mask = response_mask.bool()
+    adv_example = advantages[:,0]
+    pos_adv_mask = adv_example > 1e-12
+    neg_adv_mask = adv_example < -1e-12
+
+    delta = (old_log_prob - log_prob)             # Δ = log p_old - log p_new
+    ratio = torch.exp(-delta)                     # r = exp(log_new - log_old)
+
+    pos_adv_response_mask = mask[pos_adv_mask]
+    neg_adv_response_mask = mask[neg_adv_mask]
+
+    pos_adv_ratio = ratio[pos_adv_mask]
+    neg_adv_ratio = ratio[neg_adv_mask]
+
+    pos_adv_r_gt_1_mask = pos_adv_ratio > 1.0 + 1e-12
+    neg_adv_r_lt_1_mask = neg_adv_ratio < 1.0 - 1e-12
+
+    delta_sq = delta.pow(2)
+    pos_adv_harm_tokens_delta_sq = delta_sq[pos_adv_mask][pos_adv_r_gt_1_mask & pos_adv_response_mask]
+    neg_adv_harm_tokens_delta_sq = delta_sq[neg_adv_mask][neg_adv_r_lt_1_mask & neg_adv_response_mask]
+
+    tr_tokens_delta_sq = torch.cat([pos_adv_harm_tokens_delta_sq, neg_adv_harm_tokens_delta_sq])
+
+    return tr_tokens_delta_sq
+
 
 @deprecated("verl.trainer.ppo.core_algos.compute_policy_loss_vanilla")
 def compute_policy_loss(
@@ -861,9 +1368,29 @@ def compute_policy_loss(
         cliprange_low = cliprange
     if cliprange_high is None:
         cliprange_high = cliprange
-    pg_losses2 = -advantages * torch.clamp(
-        ratio, 1 - cliprange_low, 1 + cliprange_high
-    )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    # adv_sum = advantages.sum(dim=1)  # (batch_size,)
+    
+    # # 根据优势进行选择性裁剪
+    # # 对于adv_sum > 0的序列，只裁剪ratio > 1 + cliprange_high的token
+    # # 对于adv_sum < 0的序列，只裁剪ratio < 1 - cliprange_low的token
+    # adv_sum_positive = (adv_sum > 0).unsqueeze(1)  # (batch_size, 1)
+    # adv_sum_negative = (adv_sum < 0).unsqueeze(1)  # (batch_size, 1)
+    
+    # # 对于adv_sum > 0的序列：只裁剪ratio > 1 + cliprange_high的部分
+    # ratio_clipped_high = torch.where(
+    #     adv_sum_positive & (ratio > 1 + cliprange_high),
+    #     1 + cliprange_high,
+    #     ratio
+    # )
+    
+    # # 对于adv_sum < 0的序列：只裁剪ratio < 1 - cliprange_low的部分
+    # ratio_clipped = torch.where(
+    #     adv_sum_negative & (ratio < 1 - cliprange_low),
+    #     1 - cliprange_low,
+    #     ratio_clipped_high
+    # )
+    ratio_clipped_grpo = torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+    pg_losses2 = -advantages * ratio_clipped_grpo
     clip_pg_losses1 = torch.maximum(
         pg_losses1, pg_losses2
     )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
@@ -938,6 +1465,8 @@ def compute_policy_loss_vanilla(
     ratio = torch.exp(negative_approx_kl)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
+    ratio_stats = get_ratio_stats(ratio, advantages, response_mask, log_prob, old_log_prob)
+
     pg_losses1 = -advantages * ratio
     if cliprange_low is None:
         cliprange_low = cliprange
@@ -950,6 +1479,7 @@ def compute_policy_loss_vanilla(
         pg_losses1, pg_losses2
     )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_clipfrac_squence = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask, axis=-1)
 
     pg_losses3 = -advantages * clip_ratio_c
     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
@@ -967,7 +1497,7 @@ def compute_policy_loss_vanilla(
 
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
-    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, ratio_stats
 
 
 @register_policy_loss("gspo")

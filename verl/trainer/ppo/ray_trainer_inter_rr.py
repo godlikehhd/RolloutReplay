@@ -1233,8 +1233,10 @@ class RayPPOTrainer:
 
         # Return unchanged batch and empty metrics if IS is disabled
         return batch, {}
+    
 
-    def select_replay_batch(self, batch: DataProto) -> DataProto:
+
+    def select_replay_batch(self, batch: DataProto, replay_n: int) -> DataProto:
         """Select all replay buffer samples that match the given batch's indices.
         
         If one index in batch appears multiple times in replay_buffer, 
@@ -1246,6 +1248,12 @@ class RayPPOTrainer:
         # 取出目标和缓冲区的索引
         index_target = batch.non_tensor_batch["index"]
         index_source = self.replay_buffer.non_tensor_batch["index"]
+        token_level_scores_source = batch.batch["token_level_scores"]
+        token_level_scores_target = self.replay_buffer.batch["token_level_scores"]
+
+
+        
+        
 
         # 构建 index → [list of positions] 映射
         from collections import defaultdict
@@ -1261,7 +1269,8 @@ class RayPPOTrainer:
         selected_positions = []
         for idx in index_target:
             if idx in self.replay_index_to_positions:
-                selected_positions.extend(self.replay_index_to_positions[idx])
+                selected_positions.extend(self.replay_index_to_positions[idx][:replay_n])
+                self.replay_index_to_positions[idx] = self.replay_index_to_positions[idx][replay_n:] if len(self.replay_index_to_positions[idx]) > replay_n else []
             else:
                 print(f"[Warning] index {idx} not found in replay buffer")
 
@@ -1270,6 +1279,8 @@ class RayPPOTrainer:
 
         # 从 replay buffer 中选取这些样本
         selected_batch = self.replay_buffer.select_idxs(selected_positions)
+
+
         return selected_batch
 
     def fit(self):
@@ -1340,17 +1351,20 @@ class RayPPOTrainer:
             if self.global_steps == 1:
                 self.replay_buffer = None
             else:
+                
                 local_latest_buffer_iteration = os.path.join(self.config.trainer.default_local_dir,
                                                     'latest_checkpointed_iteration.txt')
                 with open(local_latest_buffer_iteration, 'r') as f:
-                    saved_steps = int(f.read().strip())
-                    assert self.global_steps == saved_steps + 1, "Buffer iteration mismatch"
-                replay_buffer_dir = os.path.join(self.config.trainer.default_local_dir, f'replay_buffer_{saved_steps+1}.pkl')
+                    latest_global_steps = int(f.read().strip())
+                    assert self.global_steps == latest_global_steps + 1, "Buffer iteration mismatch"
+                replay_buffer_dir = os.path.join(self.config.trainer.default_local_dir, 'replay_buffer_{}.pkl'.format(latest_global_steps))
                 self.replay_buffer = DataProto.load_from_disk(replay_buffer_dir)
+                self.replay_buffer_new = None
         else:
             self.replay_buffer = None
 
         for epoch in range(self.config.trainer.total_epochs):
+        
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
@@ -1515,227 +1529,193 @@ class RayPPOTrainer:
                                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                 config=self.config.algorithm,
                             )
-                          
-                            replay_batch = deepcopy(batch)
-                            replay_batch.meta_info.pop('global_steps', None)
-                            if self.replay_buffer is None:
-                                replay_batch.meta_info.pop('global_token_num', None)
-                                replay_batch = DataProto.convert_keys_to_int32(replay_batch) 
-                                
-                                self.replay_buffer = replay_batch
-                            else:
-                                replay_batch.meta_info.pop('global_token_num', None)
-                                replay_batch = DataProto.convert_keys_to_int32(replay_batch) 
-                                self.replay_buffer = DataProto.concat([self.replay_buffer, replay_batch])
+                            if self.config.trainer.do_replay:
+                                replay_batch = deepcopy(batch)
+                                replay_batch.meta_info.pop('global_steps', None)
+                                if self.replay_buffer is None:
+                                    replay_batch.meta_info.pop('global_token_num', None)
+                                    replay_batch = DataProto.convert_keys_to_int32(replay_batch) 
+                                    
+                                    self.replay_buffer = replay_batch
+                                else:
+                                    replay_batch.meta_info.pop('global_token_num', None)
+                                    replay_batch = DataProto.convert_keys_to_int32(replay_batch) 
+                                    self.replay_buffer = DataProto.concat([self.replay_buffer, replay_batch])
                 else:
                     print("Replaying...")
-                    # import random
-                    # if self.config.trainer.replay_mode == "intra_prompt":
-                    #     replay_size = self.config.trainer.replay_ratio * len(batch)
-                    #     replay_index = random.sample(range(len(batch)), replay_size)
-                    #     replay_batch, remaining_batch = batch.select_idxs(replay_index)
-                    #     replay_batch = self.select_replay_batch(replay_batch)
-                    #     replay_batch = DataProto.convert_keys_to_int64(replay_batch)
-                    # if len(remaining_batch) != 0:
+                    new_n = self.config.actor_rollout_ref.rollout.n * (1 - self.config.trainer.replay_ratio)
+                    replay_n = self.config.actor_rollout_ref.rollout.n * self.config.trainer.replay_ratio
+                
                         
-                    #     gen_batch = self._get_gen_batch(remaining_batch)
+                    gen_batch = self._get_gen_batch(batch)
 
                     #     # pass global_steps to trace
-                    #     gen_batch.meta_info["global_steps"] = self.global_steps
+                    gen_batch.meta_info["global_steps"] = self.global_steps
 
                 
-                    #     gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    gen_batch = gen_batch.repeat(repeat_times=new_n, interleave=True)
 
                         
                             
 
-                    #     with marked_timer("step", timing_raw):
-                    #         # generate a batch
-                    #         with marked_timer("gen", timing_raw, color="red"):
-                    #             if not self.async_rollout_mode:
-                    #                 gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                    #             else:
-                    #                 gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-
-                    #             timing_raw.update(gen_batch_output.meta_info["timing"])
-                    #             gen_batch_output.meta_info.pop("timing", None)
-                    #         # repeat to align with repeated responses in rollout
-                    #         remaining_batch = remaining_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    #         remaining_batch = remaining_batch.union(gen_batch_output)
-                    #         # batch = batch.union(gen_batch)
-
-                    #         if "response_mask" not in batch.batch.keys():
-                    #             remaining_batch.batch["response_mask"] = compute_response_mask(batch)
-                    #         # Balance the number of valid tokens across DP ranks.
-                    #         # NOTE: This usually changes the order of data in the `batch`,
-                    #         # which won't affect the advantage calculation (since it's based on uid),
-                    #         # but might affect the loss calculation (due to the change of mini-batching).
-                    #         # TODO: Decouple the DP balancing and mini-batching.
-                        
-
-                    #         # compute global_valid tokens
-                    #         # remaining_batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
-                    #         # batch.meta_info["global_steps"] = self.global_steps
-                    #         # if self.config.trainer.do_replay:
-                    #         #     batch.meta_info["do_replay"] = True
-                    #         # else:
-                    #         #     batch.meta_info["do_replay"] = False
-
-                    #         with marked_timer("reward", timing_raw, color="yellow"):
-                    #             # compute reward model score
-                    #             if self.use_rm and "rm_scores" not in batch.batch.keys():
-                    #                 reward_tensor = self.rm_wg.compute_rm_score(remaining_batch)
-                    #                 remaining_batch = remaining_batch.union(reward_tensor)
-
-                    #             if self.config.reward_model.launch_reward_fn_async:
-                    #                 future_reward = compute_reward_async.remote(data=remaining_batch, reward_fn=self.reward_fn)
-                    #             else:
-                    #                 reward_tensor, reward_extra_infos_dict = compute_reward(remaining_batch, self.reward_fn)
-
-                    #         # recompute old_log_probs
-                    #         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                    #             old_log_prob = self.actor_rollout_wg.compute_log_prob(remaining_batch)
-                    #             entropys = old_log_prob.batch["entropys"]
-                    #             response_masks = remaining_batch.batch["response_mask"]
-                    #             loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                    #             entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                    #             old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                    #             metrics.update(old_log_prob_metrics)
-                    #             # old_log_prob.batch.pop("entropys")
-                    #             remaining_batch = remaining_batch.union(old_log_prob)
-
-                    #             if "rollout_log_probs" in batch.batch.keys():
-                    #                 # TODO: we may want to add diff of probs too.
-                    #                 from verl.utils.debug.metrics import calculate_debug_metrics
-
-                    #                 metrics.update(calculate_debug_metrics(remaining_batch))
-
-                    #         if self.use_reference_policy:
-                    #             # compute reference log_prob
-                    #             with marked_timer("ref", timing_raw, color="olive"):
-                    #                 if not self.ref_in_actor:
-                    #                     ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(remaining_batch)
-                    #                 else:
-                    #                     ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(remaining_batch)
-                    #                 remaining_batch = remaining_batch.union(ref_log_prob)
-
-                    #         # compute values
-                    #         if self.use_critic:
-                    #             with marked_timer("values", timing_raw, color="cyan"):
-                    #                 values = self.critic_wg.compute_values(remaining_batch)
-                    #                 remaining_batch = remaining_batch.union(values)
-
-                    #         with marked_timer("adv", timing_raw, color="brown"):
-                    #             # we combine with rule-based rm
-                    #             reward_extra_infos_dict: dict[str, list]
-                    #             if self.config.reward_model.launch_reward_fn_async:
-                    #                 reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                    #             remaining_batch.batch["token_level_scores"] = reward_tensor
-                                    
-                    #             if reward_extra_infos_dict:
-                    #                 remaining_batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
-                    #             # compute rewards. apply_kl_penalty if available
-                    #             if self.config.algorithm.use_kl_in_reward:
-                    #                 remaining_batch, kl_metrics = apply_kl_penalty(
-                    #                     batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                    #                 )
-                    #                 metrics.update(kl_metrics)
-                    #             else:
-                    #                 remaining_batch.batch["token_level_rewards"] = remaining_batch.batch["token_level_scores"]
-                                
-                    #             # Compute rollout importance sampling weights centrally (once per batch)
-                    #             # This corrects for mismatch between rollout policy and training policy
-                    #             # Also computes mismatch metrics (KL, PPL, etc.)
-                    #             remaining_batch, is_metrics = self.compute_rollout_importance_weights_and_add_to_batch(remaining_batch)
-                    #             # IS and mismatch metrics already have mismatch/ prefix
-                    #             metrics.update(is_metrics)
-                                
-
-                    #             # compute advantages, executed on the driver process
-                    #             norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                    #                 "norm_adv_by_std_in_grpo", True
-                    #             )  # GRPO adv normalization factor
-                    #             self.value_tracker.update(remaining_batch)
-                    #             if self.config.data.weighted_random_sampler:
-                    #                 self._update_sampler()
-
-                    #             correct_num, wrong_num = self.compute_correct_ratio(remaining_batch)
-                    #             metrics['replay_batch/correct_num'] = correct_num
-                    #             metrics['replay_batch/wrong_num'] = wrong_num
-                    #             metrics['replay_batch/invalid_data_num'] = correct_num + wrong_num
-                    #             print(f"Correct num: {correct_num}, Wrong num: {wrong_num}, Invalid data num: {correct_num + wrong_num}")
-                                    
-                    #             remaining_batch = compute_advantage(
-                    #                 remaining_batch,
-                    #                 adv_estimator=self.config.algorithm.adv_estimator,
-                    #                 gamma=self.config.algorithm.gamma,
-                    #                 lam=self.config.algorithm.lam,
-                    #                 num_repeat=self.config.actor_rollout_ref.rollout.n,
-                    #                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                    #                 config=self.config.algorithm,
-                    #             )
-                    #             if self.config.trainer.do_replay:
-                    #                 replay_batch = deepcopy(remaining_batch)
-                    #                 replay_batch.meta_info.pop('global_steps', None)
-                    #                 if self.replay_buffer is None:
-                    #                     replay_batch.meta_info.pop('global_token_num', None)
-                    #                     replay_batch = DataProto.convert_keys_to_int32(replay_batch) 
-                                        
-                    #                     self.replay_buffer = replay_batch
-                    #                 else:
-                    #                     replay_batch.meta_info.pop('global_token_num', None)
-                    #                     replay_batch = DataProto.convert_keys_to_int32(replay_batch) 
-                    #                     self.replay_buffer = DataProto.concat([self.replay_buffer, replay_batch])
-                    #             batch = DataProto.concat([remaining_batch, replay_batch])
-                    #             batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
-                    #             batch.meta_info["global_steps"] = self.global_steps
-                    #             if self.config.trainer.do_replay:
-                    #                 batch.meta_info["do_replay"] = True
-                    #             else:
-                    #                 batch.meta_info["do_replay"] = False
-                    # else:
-                    #     batch = replay_batch
-                        
-                    
-                        
                     with marked_timer("step", timing_raw):
-                        replay_batch = self.select_replay_batch(batch)
-                        batch = replay_batch
-                        batch = DataProto.convert_keys_to_int64(batch)
-                        # compute global_valid tokens
-                        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                        batch.meta_info["global_steps"] = self.global_steps
-                        if self.config.trainer.do_replay:
-                            batch.meta_info["do_replay"] = True
-                        else:
-                            batch.meta_info["do_replay"] = False
-                        print("len(batch):", len(batch))
-                        if self.config.trainer.balance_batch:
-                            self._balance_batch(batch, metrics=metrics)
+                        # generate a batch
+                        with marked_timer("gen", timing_raw, color="red"):
+                            if not self.async_rollout_mode:
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            else:
+                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+
+                            timing_raw.update(gen_batch_output.meta_info["timing"])
+                            gen_batch_output.meta_info.pop("timing", None)
+                        # repeat to align with repeated responses in rollout
+                        batch = batch.repeat(repeat_times=new_n, interleave=True)
+                        batch = batch.union(gen_batch_output)
+                        
                         
 
-                    # if self.config.trainer.do_replay:
-                    #     valid_batch = self.reward_shaping_rr(batch)
-                    #     if epoch == 0:
-                    #         if self.replay_buffer is None:
+
+
+                        if "response_mask" not in batch.batch.keys():
+                            batch.batch["response_mask"] = compute_response_mask(batch)
+                        # Balance the number of valid tokens across DP ranks.
+                        # NOTE: This usually changes the order of data in the `batch`,
+                        # which won't affect the advantage calculation (since it's based on uid),
+                        # but might affect the loss calculation (due to the change of mini-batching).
+                        # TODO: Decouple the DP balancing and mini-batching.
+                    
+
+                        # compute global_valid tokens
+                        # batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+                        # batch.meta_info["global_steps"] = self.global_steps
+                        # if self.config.trainer.do_replay:
+                        #     batch.meta_info["do_replay"] = True
+                        # else:
+                        #     batch.meta_info["do_replay"] = False
+
+                        with marked_timer("reward", timing_raw, color="yellow"):
+                            # compute reward model score
+                            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
+
+                            if self.config.reward_model.launch_reward_fn_async:
+                                future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
+                            else:
+                                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                        # if self.config.trainer.balance_batch:
+                        #         self._balance_batch(batch, metrics=metrics)
+                        # recompute old_log_probs
+                        with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                            metrics.update(old_log_prob_metrics)
+                            # old_log_prob.batch.pop("entropys")
+                            batch = batch.union(old_log_prob)
+
+                            if "rollout_log_probs" in batch.batch.keys():
+                                # TODO: we may want to add diff of probs too.
+                                from verl.utils.debug.metrics import calculate_debug_metrics
+
+                                metrics.update(calculate_debug_metrics(batch))
+
+                        if self.use_reference_policy:
+                            # compute reference log_prob
+                            with marked_timer("ref", timing_raw, color="olive"):
+                                if not self.ref_in_actor:
+                                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                else:
+                                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                                batch = batch.union(ref_log_prob)
+
+                        # compute values
+                        if self.use_critic:
+                            with marked_timer("values", timing_raw, color="cyan"):
+                                values = self.critic_wg.compute_values(batch)
+                                batch = batch.union(values)
+
+                        with marked_timer("adv", timing_raw, color="brown"):
+                            # we combine with rule-based rm
+                            reward_extra_infos_dict: dict[str, list]
+                            if self.config.reward_model.launch_reward_fn_async:
+                                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            batch.batch["token_level_scores"] = reward_tensor
                                 
-                    #             self.replay_buffer = dataprotoitem_to_dataproto(valid_batch[:])
-                    #         else:
-                    #             self.replay_buffer, _ = select_buffer(self.replay_buffer, self.config) 
-                    #             self.replay_buffer = DataProto.concat([self.replay_buffer, valid_batch])
-                    #     else:
-                    #         print("Replaying...")
-                    #         self.replay_buffer, replay_batch = select_buffer(self.replay_buffer, self.config) 
-                    #         if self.replay_buffer is None:
-                    #             print("Buffer Cleared!")
+                            if reward_extra_infos_dict:
+                                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                            # compute rewards. apply_kl_penalty if available
+                            if self.config.algorithm.use_kl_in_reward:
+                                batch, kl_metrics = apply_kl_penalty(
+                                    batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                                )
+                                metrics.update(kl_metrics)
+                            else:
+                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                            
+                            # Compute rollout importance sampling weights centrally (once per batch)
+                            # This corrects for mismatch between rollout policy and training policy
+                            # Also computes mismatch metrics (KL, PPL, etc.)
+                            batch, is_metrics = self.compute_rollout_importance_weights_and_add_to_batch(batch)
+                            # IS and mismatch metrics already have mismatch/ prefix
+                            metrics.update(is_metrics)
+                            
+
+                            # compute advantages, executed on the driver process
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                                "norm_adv_by_std_in_grpo", True
+                            )  # GRPO adv normalization factor
+                            self.value_tracker.update(batch)
+                            if self.config.data.weighted_random_sampler:
+                                self._update_sampler()
+
+                            correct_num, wrong_num = self.compute_correct_ratio(batch)
+                            metrics['replay_batch/correct_num'] = correct_num
+                            metrics['replay_batch/wrong_num'] = wrong_num
+                            metrics['replay_batch/invalid_data_num'] = correct_num + wrong_num
+                            print(f"Correct num: {correct_num}, Wrong num: {wrong_num}, Invalid data num: {correct_num + wrong_num}")
                                 
-                    #             self.replay_buffer = dataprotoitem_to_dataproto(valid_batch[:])
-                    #         else:
-                    #             self.replay_buffer = DataProto.concat([self.replay_buffer, valid_batch])
-                    #     batch = DataProto.concat([valid_batch, replay_batch])
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
+                            )
+                            if self.config.trainer.do_replay:
+                                replay_batch = deepcopy(batch)
+                                replay_batch.meta_info.pop('global_steps', None)
+                                if self.replay_buffer_new is None:
+                                    replay_batch.meta_info.pop('global_token_num', None)
+                                    replay_batch = DataProto.convert_keys_to_int32(replay_batch) 
+                                    
+                                    self.replay_buffer_new = replay_batch
+                                else:
+                                    replay_batch.meta_info.pop('global_token_num', None)
+                                    replay_batch = DataProto.convert_keys_to_int32(replay_batch) 
+                                    self.replay_buffer_new = DataProto.concat([self.replay_buffer_new, replay_batch])
+                            replay_batch_adv = self.select_replay_batch(batch, replay_n)
+                            batch = DataProto.concat([batch, replay_batch_adv])
+                            batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+                            batch.meta_info["global_steps"] = self.global_steps
+                            if self.config.trainer.do_replay:
+                                batch.meta_info["do_replay"] = True
+                            else:
+                                batch.meta_info["do_replay"] = False
+                            print("len(batch):", len(batch))
+                            if self.config.trainer.balance_batch:
+                                self._balance_batch(batch, metrics=metrics)
+                        
+
+                   
 
                                     
                 # update critic
@@ -1850,14 +1830,11 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
-                
-                # if self.global_steps % 20 == 0 and self.global_steps > 0:
-                #     print(f"Resetting model at global step {self.global_steps}")
-                #     self._reset_model()
-            if epoch == 0 and self.replay_buffer is not None:
+            if self.config.trainer.do_replay and self.replay_buffer_new is not None:
                 replay_buffer_dir = os.path.join(self.config.trainer.default_local_dir, 'replay_buffer_{}.pkl'.format(self.global_steps))
-                self.replay_buffer.save_to_disk(replay_buffer_dir)
-            
+                self.replay_buffer_new.save_to_disk(replay_buffer_dir)
+            self.replay_bufffer = self.replay_buffer_new
+            self.replay_buffer_new = None
 
             
     def compute_correct_ratio(self, batch: DataProto) -> tuple[int, int]:

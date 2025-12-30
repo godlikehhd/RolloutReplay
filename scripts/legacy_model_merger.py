@@ -705,6 +705,11 @@ def main():
         default=None,
         help="(Deprecated) Path to the original Hugging Face model for config.",
     )
+
+    base_op_parser.add_argument(
+        "--hf_config_path", type=str, required=True, help="Path to the Hugging Face model config directory"
+    )
+
     base_op_parser.add_argument(
         "--tie-word-embedding",
         action="store_true",
@@ -734,6 +739,7 @@ def main():
         "--test_hf_dir", type=str, required=True, help="Path to the reference Hugging Face model directory for testing"
     )
 
+    
     args = parser.parse_args()
 
     common_config_args = {
@@ -743,7 +749,7 @@ def main():
         "is_value_model": args.is_value_model,
         "local_dir": args.local_dir,
         "hf_model_path": args.hf_model_path,
-        "hf_model_config_path": args.local_dir,
+        "hf_model_config_path": args.hf_config_path,
     }
 
     if args.operation == "merge":

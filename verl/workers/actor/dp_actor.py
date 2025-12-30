@@ -19,15 +19,14 @@ Single Process Actor
 
 import logging
 import os
-
+import torch.distributed as dist
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
-
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty, compute_m2po_policy_loss, compute_m2po_policy_loss_symmetric
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -332,8 +331,12 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        # print("len(micro_batches):", len(micro_batches))
+
+
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
+            # print(f"micro_batch device: {get_device_id()}")
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(
@@ -362,6 +365,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
+        global_steps = data.meta_info["global_steps"]
+        do_replay = data.meta_info["do_replay"]
         select_keys = [
             "responses",
             "response_mask",
@@ -370,6 +375,8 @@ class DataParallelPPOActor(BasePPOActor):
             "position_ids",
             "old_log_probs",
             "advantages",
+            "entropys",
+
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
@@ -382,18 +389,22 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("rollout_log_probs")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else ["index"]
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.split(self.config.ppo_mini_batch_size)
-
+        # print(f"mini_batch size: {self.config.ppo_mini_batch_size}")
+        # print(f"mini_batches: {len(mini_batches)}")
+        # print(f"batch length: {len(data)}")
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
-
+        print(f"on_policy: {on_policy}")
         metrics = {}
-        for _ in range(self.config.ppo_epochs):
+        
+        for epoch_idx in range(self.config.ppo_epochs):
+            save_batch = []
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
@@ -408,14 +419,17 @@ class DataParallelPPOActor(BasePPOActor):
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
+                    # print(f"micro_batch device: {get_device_id()}")
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
+                    old_entropy = model_inputs["entropys"]
                     rollout_log_probs = model_inputs["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
                     advantages = model_inputs["advantages"]
 
                     entropy_coeff = self.config.entropy_coeff
+                    compute_entropy = self.config.compute_entropy
                     loss_agg_mode = self.config.loss_agg_mode
 
                     if self.config.use_dynamic_bsz:
@@ -425,31 +439,69 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # all return: (bsz, response_length)
                     calculate_entropy = False
-                    if entropy_coeff != 0:
+                    if entropy_coeff != 0 or compute_entropy:
                         calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
-
-                    if on_policy:
+                    # print(f"entropy device: {entropy.get_device()}")
+                    micro_batch.batch["new_entropy"] = entropy.detach().cpu()
+                    micro_batch.batch["new_log_prob"] = log_prob.detach().cpu()
+                    save_batch.append(micro_batch)
+                    if on_policy and do_replay==False:
                         old_log_prob = log_prob.detach()
                     else:
                         old_log_prob = model_inputs["old_log_probs"]
 
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                    # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
-                    # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
-                    # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
-                    policy_loss_fn = get_policy_loss_fn(loss_mode)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_log_probs=rollout_log_probs,
-                    )
+
+                    if self.config.get('use_m2po_loss', False):
+                        print('>>> Use m2po loss')
+                        M2_budget = self.config.get("M2_budget", None)
+                        miniclip_low = self.config.get("miniclip_low", None)
+                        miniclip_high = self.config.get("miniclip_high", None)
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, ratio_stats = compute_m2po_policy_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            M2_budget=M2_budget,
+                            miniclip_low=miniclip_low,
+                            miniclip_high=miniclip_high,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                    elif self.config.get('use_m2po_loss_symmetric', False):
+                        # print('>>> Use m2po loss symmetric')
+                        M2_budget = self.config.get("M2_budget", None)
+                        miniclip_low = self.config.get("miniclip_low", None)
+                        miniclip_high = self.config.get("miniclip_high", None)
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, ratio_stats = compute_m2po_policy_loss_symmetric(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            entropy=entropy,
+                            old_entropy=old_entropy,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            M2_budget=M2_budget,
+                            miniclip_low=miniclip_low,
+                            miniclip_high=miniclip_high,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                    else:
+
+                        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                        # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+                        # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
+                        # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                        policy_loss_fn = get_policy_loss_fn(loss_mode)
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, ratio_stats = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_log_probs=rollout_log_probs,
+                        )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
@@ -477,19 +529,30 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss = policy_loss * loss_scale_factor
                     loss.backward()
-
+                    entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                    entropy_agg_old = agg_loss(loss_mat=old_entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                     micro_batch_metrics.update(
                         {
                             "actor/pg_loss": pg_loss.detach().item() * loss_scale_factor,
                             "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                             "actor/ppo_kl": ppo_kl.detach().item(),
                             "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                            "actor/new_entropy": entropy_agg.detach().item(),
+                            "actor/old_entropy": entropy_agg_old.detach().item(),
                         }
                     )
                     append_to_dict(metrics, micro_batch_metrics)
+                    if ratio_stats is not None:
+                        append_to_dict(metrics, ratio_stats)
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+            save_batch = DataProto.concat(save_batch)
+            
+            rank = dist.get_rank()        # global rank
+            local_rank = int(os.environ["LOCAL_RANK"])
+            # print(f"rank: {rank}, local_rank: {local_rank}")
+            save_batch.save_to_disk(f'{self.config.save_batch_dir}/global_steps_{global_steps}_epoch_{epoch_idx}_rank_{rank}.pkl')
         self.actor_optimizer.zero_grad()
         return metrics

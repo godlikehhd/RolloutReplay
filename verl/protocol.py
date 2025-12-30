@@ -1106,6 +1106,36 @@ class DataProto:
             meta_info=self.meta_info,
         )
 
+    @staticmethod
+    def convert_keys_to_int32(dataP):
+        keys = [
+            "attention_mask",
+            "input_ids",
+            "position_ids",
+            "prompts",
+            "response_mask",
+            "responses"
+        ]
+        for k in keys:
+            if isinstance(dataP.batch[k], torch.Tensor) and dataP.batch[k].dtype == torch.int64:
+                dataP.batch[k] = dataP.batch[k].to(torch.int32)
+        return dataP
+
+    @staticmethod
+    def convert_keys_to_int64(dataP):
+        keys = [
+            "attention_mask",
+            "input_ids",
+            "position_ids",
+            "prompts",
+            "response_mask",
+            "responses"
+            ]
+        for k in keys:
+            if isinstance(dataP.batch[k], torch.Tensor) and dataP.batch[k].dtype == torch.int32:
+                dataP.batch[k] = dataP.batch[k].to(torch.int64)
+        return dataP
+
     def to_tensordict(self) -> TensorDict:
         """Convert this DataProto to TensorDict. Note that this requires tensordict version at least 0.10
 

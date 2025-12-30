@@ -59,6 +59,10 @@ custom_reward_function:
   # The name of the reward function within the specified file. Default is 'compute_score'.
   name: compute_score
 
+reward_config:
+  verification_reward_type: baseline
+  auxiliary_rewards: ""
+
 # config for the algorithm
 algorithm:
 
@@ -82,8 +86,29 @@ algorithm:
 
   # How to estimate KL divergence: "kl", "abs", "mse", "low_var_kl", or "full"
   kl_penalty: kl
+  rollout_is_threshold: null
+
+  # Lower threshold for IS weights (null = auto-reciprocal of upper)
+  rollout_is_threshold_lower: null
+
+  # Aggregation level: "token" (biased), "sequence" (unbiased), "geometric" (experimental)
+  rollout_is_level: token
+
+  # Bounding mode: "truncate" (cap upper only), "mask" (zero outside bounds)
+  rollout_is_mode: truncate
+
+  # Per-token veto threshold for catastrophic outliers
+  rollout_is_veto_threshold: 1e-4
+
+  # Whether to apply IS weights to policy loss
+  # true = apply weights to loss, false = compute metrics only (no weight application)
+  # Useful for monitoring mismatch before enabling correction
+  rollout_is: false
+  
 
   # KL control configuration
+  perturb_advantage: False
+  normalize_batch_advantage: False
   kl_ctrl:
 
     # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
@@ -151,6 +176,16 @@ trainer:
 
   # Save frequency (by iteration) for model checkpoints
   save_freq: -1
+
+  do_replay: False
+
+  replay_ratio: 0.125
+  replay_mode: inter_prompt
+
+  do_reset: False
+  reset_freq: 100
+  
+ 
 
   # ESI refers to the elastic server instance used during training, similar to the training plan. For example,
   # if you purchase 10 hours of computing power, the ESI will automatically shut down after 10 hours of training.

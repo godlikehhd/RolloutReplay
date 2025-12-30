@@ -72,6 +72,7 @@ class ActorConfig(BaseConfig):
         clip_ratio_c (float): Clipping ratio for critic loss.
         loss_agg_mode (str): Loss aggregation mode. Options: 'token-mean', 'sample-mean'.
         entropy_coeff (float): Entropy coefficient for regularization.
+        compute_entropy (bool): Whether to compute entropy.
         use_kl_loss (bool): Whether to use KL divergence loss.
         use_torch_compile (bool): Whether to use torch.compile for optimization.
         kl_loss_coef (float): KL divergence loss coefficient.
@@ -106,12 +107,17 @@ class ActorConfig(BaseConfig):
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0
+    compute_entropy: bool = False
+    save_batch_dir: str = "/local_data/shares/yhe/ppo_batchs/"
     tis_imp_ratio_cap: float = -1
     use_kl_loss: bool = False
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001
     kl_loss_type: str = "low_var_kl"
     ppo_epochs: int = 1
+    use_m2po_loss: bool = False
+    M2_budget: float = 0.04
+    use_m2po_loss_symmetric: bool = False
     shuffle: bool = False
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
